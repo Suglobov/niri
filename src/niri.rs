@@ -414,6 +414,9 @@ pub struct Niri {
     pub ipc_server: Option<IpcServer>,
     pub ipc_outputs_changed: bool,
 
+    /// Current cursor position in the global layout space.
+    pub mouse_position: (f64, f64),
+
     pub satellite: Option<Satellite>,
 
     #[cfg(feature = "xdp-gnome-screencast")]
@@ -2654,6 +2657,8 @@ impl Niri {
 
             ipc_server,
             ipc_outputs_changed: false,
+
+            mouse_position: (0.0, 0.0),
 
             satellite: None,
 

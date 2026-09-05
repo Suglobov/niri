@@ -49,6 +49,8 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
         Msg::Casts => Request::Casts,
+        Msg::CursorPosition => Request::CursorPosition,
+        Msg::CursorPositionStream => Request::CursorPositionStream,
     };
 
     let mut socket = Socket::connect().context("error connecting to the niri socket")?;
@@ -548,6 +550,36 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             for cast in casts {
                 print_cast(&cast);
                 println!();
+            }
+        }
+        Msg::CursorPosition => {
+            let Response::CursorPosition(cursor) = response else {
+                bail!("unexpected response: expected CursorPosition, got {response:?}");
+            };
+
+            if json {
+                let cursor =
+                    serde_json::to_string(&cursor).context("error formatting response")?;
+                println!("{cursor}");
+                return Ok(());
+            }
+
+            println!("Cursor position: ({:.2}, {:.2})", cursor.x, cursor.y);
+        }
+        Msg::CursorPositionStream => {
+            let Response::Handled = response else {
+                bail!("unexpected response: expected Handled, got {response:?}");
+            };
+
+            let mut read_cursor = socket.read_cursor_position();
+            loop {
+                let (x, y) =
+                    read_cursor().context("error reading cursor position from niri")?;
+                if json {
+                    println!("[{x}, {y}]");
+                } else {
+                    println!("Cursor position: ({x:.2}, {y:.2})");
+                }
             }
         }
     }

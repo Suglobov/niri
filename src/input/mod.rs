@@ -2674,6 +2674,9 @@ impl State {
         #[cfg(feature = "dbus")]
         self.a11y_notify_pointer_motion();
 
+        // Send IPC event.
+        self.ipc_cursor_moved(new_pos.x, new_pos.y);
+
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
         self.niri.queue_redraw_all();
@@ -2769,6 +2772,9 @@ impl State {
         // Notify a11y.
         #[cfg(feature = "dbus")]
         self.a11y_notify_pointer_motion();
+
+        // Send IPC event.
+        self.ipc_cursor_moved(pos.x, pos.y);
 
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
@@ -5219,6 +5225,22 @@ pub fn mods_with_tablet_stylus_binds(mod_key: ModKey, binds: &Binds) -> HashSet<
             Trigger::TabletStylusButton3,
         ],
     )
+}
+
+impl State {
+    pub fn ipc_cursor_moved(&mut self, x: f64, y: f64) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        if self.niri.mouse_position.0 == x && self.niri.mouse_position.1 == y {
+            return;
+        }
+
+        self.niri.mouse_position = (x, y);
+
+        server.send_cursor_position(x, y);
+    }
 }
 
 fn grab_allows_hot_corner(grab: &(dyn PointerGrab<State> + 'static)) -> bool {

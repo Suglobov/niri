@@ -119,6 +119,13 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Request current cursor position.
+    CursorPosition,
+    /// Start continuously receiving cursor position events.
+    ///
+    /// The compositor should reply with `Reply::Ok(Response::Handled)`, then continuously send
+    /// `CursorPosition { x, y }` events, one per line.
+    CursorPositionStream,
 }
 
 /// Reply from niri to client.
@@ -165,6 +172,8 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// Current cursor position.
+    CursorPosition(CursorPosition),
 }
 
 /// Overview information.
@@ -1564,6 +1573,16 @@ pub struct Cast {
     /// This is `None` for wlr-screencopy casts, and also for PipeWire casts before the node is
     /// created (when the cast is just starting up).
     pub pw_node_id: Option<u32>,
+}
+
+/// Cursor position.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct CursorPosition {
+    /// X coordinate in the global layout space.
+    pub x: f64,
+    /// Y coordinate in the global layout space.
+    pub y: f64,
 }
 
 /// Kind of screencast.

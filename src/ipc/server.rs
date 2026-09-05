@@ -17,8 +17,8 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Timestamp, WindowLayout, Workspace,
+    Action, CursorPosition, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request,
+    Response, Timestamp, WindowLayout, Workspace,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -41,6 +41,11 @@ use crate::window::Mapped;
 // number in our buffer, we drop that event stream client.
 const EVENT_STREAM_BUFFER_SIZE: usize = 64;
 
+pub struct CursorPositionStreamSender {
+    events: Sender<(f64, f64)>,
+    disconnect: Sender<()>,
+}
+
 pub struct IpcServer {
     /// Path to the IPC socket.
     ///
@@ -48,6 +53,7 @@ pub struct IpcServer {
     pub socket_path: Option<PathBuf>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    cursor_position_streams: Rc<RefCell<Vec<CursorPositionStreamSender>>>,
 }
 
 struct ClientCtx {
@@ -56,6 +62,7 @@ struct ClientCtx {
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    cursor_position_streams: Rc<RefCell<Vec<CursorPositionStreamSender>>>,
 }
 
 struct EventStreamClient {
@@ -109,6 +116,7 @@ impl IpcServer {
             socket_path,
             event_streams: Rc::new(RefCell::new(Vec::new())),
             event_stream_state: Rc::new(RefCell::new(EventStreamState::default())),
+            cursor_position_streams: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -126,6 +134,24 @@ impl IpcServer {
                     );
                     to_remove.push(idx);
                 }
+            }
+        }
+
+        for idx in to_remove.into_iter().rev() {
+            let stream = streams.swap_remove(idx);
+            let _ = stream.disconnect.send_blocking(());
+        }
+    }
+
+    pub fn send_cursor_position(&self, x: f64, y: f64) {
+        let mut streams = self.cursor_position_streams.borrow_mut();
+        let mut to_remove = Vec::new();
+        for (idx, stream) in streams.iter_mut().enumerate() {
+            // For cursor position, just drop the event if the buffer is full.
+            // Cursor position updates are high-frequency and it's fine to skip some.
+            match stream.events.try_send((x, y)) {
+                Err(TrySendError::Closed(_)) => to_remove.push(idx),
+                _ => (),
             }
         }
 
@@ -172,6 +198,7 @@ fn on_new_ipc_client(state: &mut State, stream: UnixStream) {
         ipc_outputs: state.backend.ipc_outputs(),
         event_streams: ipc_server.event_streams.clone(),
         event_stream_state: ipc_server.event_stream_state.clone(),
+        cursor_position_streams: ipc_server.cursor_position_streams.clone(),
     };
 
     let future = async move {
@@ -207,6 +234,8 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
             .map_err(|err| err.to_string());
         let requested_error = matches!(request, Ok(Request::ReturnError));
         let requested_event_stream = matches!(request, Ok(Request::EventStream));
+        let requested_cursor_position_stream =
+            matches!(request, Ok(Request::CursorPositionStream));
 
         let reply = match request {
             Ok(request) => process(&ctx, request).await,
@@ -257,6 +286,36 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
             {
                 let mut streams = ctx.event_streams.borrow_mut();
                 let sender = EventStreamSender {
+                    events: events_tx,
+                    disconnect: disconnect_tx,
+                };
+                streams.push(sender);
+            }
+
+            return Ok(());
+        }
+
+        if requested_cursor_position_stream {
+            let (events_tx, events_rx) = async_channel::bounded(512);
+            let (disconnect_tx, disconnect_rx) = async_channel::bounded(1);
+
+            // Spawn a task for the client.
+            let future = async move {
+                if let Err(err) =
+                    handle_cursor_position_stream_client(events_rx, disconnect_rx, Box::new(write) as _)
+                        .await
+                {
+                    warn!("error handling cursor position stream client: {err:?}");
+                }
+            };
+            if let Err(err) = ctx.scheduler.schedule(future) {
+                warn!("error scheduling cursor position stream future: {err:?}");
+            }
+
+            // Add it to the list.
+            {
+                let mut streams = ctx.cursor_position_streams.borrow_mut();
+                let sender = CursorPositionStreamSender {
                     events: events_tx,
                     disconnect: disconnect_tx,
                 };
@@ -445,6 +504,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             Response::FocusedOutput(output)
         }
         Request::EventStream => Response::Handled,
+        Request::CursorPositionStream => Response::Handled,
         Request::OverviewState => {
             let state = ctx.event_stream_state.borrow();
             let is_open = state.overview.is_open;
@@ -454,6 +514,19 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let state = ctx.event_stream_state.borrow();
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
+        }
+        Request::CursorPosition => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let cursor = state.niri.mouse_position;
+                let _ = tx.send_blocking(CursorPosition {
+                    x: cursor.0,
+                    y: cursor.1,
+                });
+            });
+            let result = rx.recv().await;
+            let cursor = result.map_err(|_| String::from("error getting cursor position"))?;
+            Response::CursorPosition(cursor)
         }
     };
 
@@ -506,6 +579,32 @@ async fn handle_event_stream_client(client: EventStreamClient) -> anyhow::Result
             // Normal client disconnection.
             Err(err) if err.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
             res @ Err(_) => res.context("error writing event")?,
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_cursor_position_stream_client(
+    events: Receiver<(f64, f64)>,
+    disconnect: async_channel::Receiver<()>,
+    mut write: Box<dyn AsyncWrite + Unpin>,
+) -> anyhow::Result<()> {
+    while let Ok((x, y)) = events.recv().await {
+        let buf = serde_json::to_vec(&(x, y)).context("error formatting cursor position")?;
+        let mut buf: Vec<u8> = buf;
+        buf.push(b'\n');
+
+        let res = select_biased! {
+            _ = disconnect.recv().fuse() => return Ok(()),
+            res = write.write_all(&buf).fuse() => res,
+        };
+
+        match res {
+            Ok(()) => (),
+            // Normal client disconnection.
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+            res @ Err(_) => res.context("error writing cursor position")?,
         }
     }
 

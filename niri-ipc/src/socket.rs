@@ -98,4 +98,22 @@ impl Socket {
             Ok(event)
         }
     }
+
+    /// Starts reading cursor position events from the socket.
+    ///
+    /// The returned function will block until the next cursor position `(x, y)` arrives,
+    /// then return it.
+    ///
+    /// Use this only after requesting a [`CursorPositionStream`][Request::CursorPositionStream].
+    pub fn read_cursor_position(self) -> impl FnMut() -> io::Result<(f64, f64)> {
+        let Self { mut stream } = self;
+
+        let mut buf = String::new();
+        move || {
+            buf.clear();
+            stream.read_line(&mut buf)?;
+            let position: (f64, f64) = serde_json::from_str(&buf)?;
+            Ok(position)
+        }
+    }
 }
